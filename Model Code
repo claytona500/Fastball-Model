@@ -1,0 +1,196 @@
+library(caret)
+library(randomForest)
+library(tidyverse)
+library(Boruta)
+library(gt)
+
+# Load and preprocess data
+load_and_preprocess_data <- function(file_path) {
+  data <- read.csv(file_path) %>%
+    na.omit() %>%
+    group_by(Name) %>%
+    summarize(
+      across(
+        c(V.Mov, H.Mov, active_spin, Release.Spin.Rate, spin_axis,
+          VAA, HAA, Release.Speed, Release.Pos.X, Release.Pos.Y,
+          Release.Pos.Z, Effective.Speed),
+        median
+      )
+    )
+  return(data)
+}
+
+# Feature selection with Boruta
+feature_selection <- function(data, formula) {
+  boruta_fs <- Boruta(formula, data = data)
+  print(boruta_fs)
+  plot(boruta_fs)
+  return(boruta_fs)
+}
+
+# Train models with k-fold cross-validation
+train_models_with_cv <- function(data, formula_v, formula_h, k = 10) {
+  # Set up cross-validation
+  control <- trainControl(method = "cv", number = k)
+  
+  # Set up parameter grid with mtry=9
+  tune_grid <- expand.grid(.mtry = 9)
+  
+  # Train models with mtry=9
+  ivb_model <- train(formula_v, data = data, trControl = control, tuneGrid = tune_grid)
+  ihb_model <- train(formula_h, data = data, trControl = control, tuneGrid = tune_grid)
+  
+  return(list(ivb_model, ihb_model))
+}
+
+# Main code
+dash_2021 <- load_and_preprocess_data("~/Downloads/dashboard_Full Data_data (1).csv")
+dash_2022 <- load_and_preprocess_data("~/Downloads/dashboard_Full Data_data (2).csv")
+
+boruta_formula_2021 <- V.Mov + H.Mov ~ Release.Speed + Effective.Speed + active_spin +
+  spin_axis + Release.Spin.Rate + VAA + Release.Pos.X + Release.Pos.Y + Release.Pos.Z
+boruta_formula_2022 <- update(boruta_formula_2021, . ~ . + HAA)
+
+boruta_fs_2021 <- feature_selection(dash_2021, boruta_formula_2021)
+boruta_fs_2022 <- feature_selection(dash_2022, boruta_formula_2022)
+
+train_formula_v <- V.Mov ~ Release.Speed + Effective.Speed + active_spin +
+  spin_axis + Release.Spin.Rate + VAA + Release.Pos.X + Release.Pos.Z + HAA
+train_formula_h <- update(train_formula_v, H.Mov ~ .)
+
+# Train models using 10-fold cross-validation
+models_with_cv <- train_models_with_cv(dash_2021, train_formula_v, train_formula_h)
+
+ivb_model_with_cv <- models_with_cv[[1]]
+ihb_model_with_cv <- models_with_cv[[2]]
+
+# Access cross-validation results for IVB model
+ivb_cv_results <- ivb_model_with_cv$results
+print(ivb_cv_results)
+
+# Access cross-validation results for IHB model
+ihb_cv_results <- ihb_model_with_cv$results
+print(ihb_cv_results)
+
+# Calculate mean and standard deviation of RMSE and Rsquared for IVB model
+ivb_mean_rmse <- mean(ivb_cv_results$RMSE)
+ivb_sd_rmse <- sd(ivb_cv_results$RMSE)
+ivb_mean_r2 <- mean(ivb_cv_results$Rsquared)
+ivb_sd_r2 <- sd(ivb_cv_results$Rsquared)
+
+cat("IVB Model:\n")
+cat(paste("Mean RMSE:", ivb_mean_rmse, "SD RMSE:", ivb_sd_rmse, "\n"))
+cat(paste("Mean Rsquared:", ivb_mean_r2, "SD Rsquared:", ivb_sd_r2, "\n"))
+
+# Calculate mean and standard deviation of RMSE and Rsquared for IHB model
+ihb_mean_rmse <- mean(ihb_cv_results$RMSE)
+ihb_sd_rmse <- sd(ihb_cv_results$RMSE)
+ihb_mean_r2 <- mean(ihb_cv_results$Rsquared)
+ihb_sd_r2 <- sd(ihb_cv_results$Rsquared)
+
+cat("\nIHB Model:\n")
+cat(paste("Mean RMSE:", ihb_mean_rmse, "SD RMSE:", ihb_sd_rmse, "\n"))
+cat(paste("Mean Rsquared:", ihb_mean_r2, "SD Rsquared:", ihb_sd_r2, "\n"))
+
+# Make predictions
+predictions_ivb <- predict(ivb_model_with_cv, dash_2022)
+predictions_ihb <- predict(ihb_model_with_cv, dash_2022)
+
+dash_2022 <- dash_2022 %>%
+  mutate(xIVB = predictions_ivb,
+         xHB = predictions_ihb,
+         diffVB = V.Mov - xIVB,
+         diffHB = H.Mov - xHB)
+
+# Print dash_2022 with predictions and differences
+print(dash_2022)
+
+# Sort the data by the diffVB column in descending order
+sorted_dash_2022 <- dash_2022 %>%
+  arrange(desc(diffVB))
+
+# Get the top 10 best performers
+top_10_best <- sorted_dash_2022[1:10, ]
+
+# Get the top 10 worst performers
+top_10_worst <- sorted_dash_2022[(nrow(sorted_dash_2022) - 9):nrow(sorted_dash_2022), ]
+
+# Combine the top 10 best and worst performers into one table
+top_10_best_worst <- rbind(top_10_best, top_10_worst)
+
+# Round the diffVB and xIVB columns to 2 decimal places
+top_10_best <- top_10_best %>%
+  mutate(
+    xIVB = round(xIVB, 2),
+    diffVB = round(diffVB, 2),
+    active_spin = paste0(round(as.numeric(active_spin) * 100, 2), "%"),
+    Name = gsub(",", "", Name) %>%  
+      str_split(" ", 2) %>%
+      lapply(rev) %>%
+      lapply(paste, collapse = " ") %>%
+      unlist()
+  )
+
+
+top_10_worst <- top_10_worst %>%
+  mutate(
+    xIVB = round(xIVB, 2),
+    diffVB = round(diffVB, 2),
+    active_spin = paste0(round(as.numeric(active_spin) * 100, 2), "%"),
+    Name = gsub(",", "", Name) %>%  
+      str_split(" ", 2) %>%
+      lapply(rev) %>%
+      lapply(paste, collapse = " ") %>%
+      unlist()
+  ) %>%
+  arrange(diffVB)
+
+nice_table <- top_10_best %>%
+  select(Name, V.Mov, xIVB, diffVB, active_spin) %>%
+  gt() %>%
+  tab_header(title = "Overachievers") %>%
+  cols_label(
+    Name = "Name",
+    V.Mov = "IVB",
+    xIVB = "xIVB",
+    diffVB = "Difference",
+    active_spin = "Spin Efficiency"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold", size = "large", color = "white"),
+    locations = cells_title()
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold", color = "white"),
+    locations = cells_column_labels()
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "black"),
+    locations = cells_title()
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "black"),
+    locations = cells_column_labels()
+  ) %>%
+  tab_style(
+    style = cell_text(color = "white"),
+    locations = cells_body()
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "black"),
+    locations = cells_body()
+  ) %>%
+  tab_options(
+    table.font.names = "Times New Roman", # Replace "Arial" with your preferred font
+    table.border.top.width = px(0),
+    table.border.bottom.width = px(0),
+    table.border.left.width = px(0),
+    table.border.right.width = px(0)
+  )
+
+# Display the table in the console
+print(nice_table)
+
+
+
+
