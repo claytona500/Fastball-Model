@@ -6,17 +6,21 @@ library(gt)
 
 # Load and preprocess data
 load_and_preprocess_data <- function(file_path) {
-  data <- read.csv(file_path) %>%
+  data <- read_csv(file_path)
+  # Replace spaces in column names with underscores
+  names(data) <- gsub(" ", "_", names(data))
+  data <- data %>%
     na.omit() %>%
-    group_by(Name) %>%
-    summarize(
-      across(
-        c(V.Mov, H.Mov, active_spin, Release.Spin.Rate, spin_axis,
-          VAA, HAA, Release.Speed, Release.Pos.X, Release.Pos.Y,
-          Release.Pos.Z, Effective.Speed),
-        median
-      )
-    )
+    mutate(Pitcher_throws = factor(Pitcher_throws, levels = c("RHP", "LHP"))) %>%
+    group_by(Name, Pitcher_throws) %>%
+    summarize(across(active_spin:Vz0, median), .groups = "drop")
+  
+  data$Release_Pos_Z = data$`Release_Pos_Z_(fixed)`
+  data$Release_Pos_X = data$`Release_Pos_X_(fixed)`
+    
+  data <- data %>% 
+     select(-`VAA_AA,_pitch_type`, -`Release_Pos_Z_(fixed)`, -`Release_Pos_X_(fixed)`)
+  
   return(data)
 }
 
@@ -24,9 +28,15 @@ load_and_preprocess_data <- function(file_path) {
 feature_selection <- function(data, formula) {
   boruta_fs <- Boruta(formula, data = data)
   print(boruta_fs)
-  plot(boruta_fs)
+  plot(boruta_fs, xlab = "", ylab = "")
+  
+  # Add variable names to the plot
+  all_names <- colnames(data[, -1])
+  text(x = 1:length(all_names), y = -0.5, labels = all_names, xpd = NA, srt = 90, adj = 1, cex = 0.8)
+  
   return(boruta_fs)
 }
+
 
 # Train models with k-fold cross-validation
 train_models_with_cv <- function(data, formula_v, formula_h, k = 10) {
@@ -43,23 +53,64 @@ train_models_with_cv <- function(data, formula_v, formula_h, k = 10) {
   return(list(ivb_model, ihb_model))
 }
 
+print_boruta_importance <- function(data, boruta_output) {
+  selected_attributes <- getSelectedAttributes(boruta_output)
+  importance_values <- boruta_output$ImpHistory[which(boruta_output$finalDecision == "Confirmed"), ]
+  if (length(selected_attributes) != ncol(importance_values)) {
+    importance_values <- importance_values[, selected_attributes]
+  }
+  importance_df <- data.frame(attribute = selected_attributes, importance = colMeans(importance_values))
+  importance_df <- importance_df[order(importance_df$importance, decreasing = TRUE), ]
+  return(importance_df)
+}
+
+
 # Main code
-dash_2021 <- load_and_preprocess_data("~/Downloads/dashboard_Full Data_data (1).csv")
-dash_2022 <- load_and_preprocess_data("~/Downloads/dashboard_Full Data_data (2).csv")
+dash_2021 <- load_and_preprocess_data("~/Downloads/2021_pitch_characteristics.csv")
+dash_2022 <- load_and_preprocess_data("~/Downloads/2022_pitch_characteristics.csv")
 
-boruta_formula_2021 <- V.Mov + H.Mov ~ Release.Speed + Effective.Speed + active_spin +
-  spin_axis + Release.Spin.Rate + VAA + Release.Pos.X + Release.Pos.Y + Release.Pos.Z
-boruta_formula_2022 <- update(boruta_formula_2021, . ~ . + HAA)
+# Assuming dash_2021 is a data frame containing your variables
+response_variables <- c("V_Mov", "H_Mov")
 
-boruta_fs_2021 <- feature_selection(dash_2021, boruta_formula_2021)
-boruta_fs_2022 <- feature_selection(dash_2022, boruta_formula_2022)
+independent_variables <- setdiff(names(dash_2021), c("Name", response_variables))
 
-train_formula_v <- V.Mov ~ Release.Speed + Effective.Speed + active_spin +
-  spin_axis + Release.Spin.Rate + VAA + Release.Pos.X + Release.Pos.Z + HAA
-train_formula_h <- update(train_formula_v, H.Mov ~ .)
+# Collapse the independent variables into a single string with the '+' symbol
+independent_variables_string <- paste(sapply(independent_variables, function(x) {
+  if (grepl("[^[:alnum:]_]", x)) {
+    paste0("`", x, "`")
+  } else {
+    x
+  }
+}), collapse = " + ")
+
+# Create the formula for both H_Mov and V_Mov
+#boruta_formula <- as.formula(paste0(paste(response_variables, collapse = " + "), " ~ ", independent_variables_string))
+#Just Vertical or horizontal
+boruta_formula <- as.formula(paste0("H_Mov", " ~ ", independent_variables_string))
+#Just Horizontal
+#boruta_formula <- as.formula(paste0(paste(response_variables, collapse = " + "), " ~ ", independent_variables_string))
+
+boruta_fs_2021 <- feature_selection(dash_2021, boruta_formula)
+print_boruta_importance(dash_2021, boruta_fs_2021)
+
+# Extract the important variables from the Boruta output
+important_vars <- getSelectedAttributes(boruta_fs_2021)
+
+# Create a new string with important independent variables
+important_variables_string <- paste(important_vars, collapse = " + ")
+
+# Update your formulae to include only the important variables
+train_formula_v <- as.formula(paste("V_Mov", " ~ ", important_variables_string))
+#this is the horizontal movement formula. Commented out because doing only vertical
+
+boruta_fs_2021 <- feature_selection(dash_2021, train_formula_v)
+
+train_formula_h <- update(train_formula_v, H_Mov ~ .)
 
 # Train models using 10-fold cross-validation
-models_with_cv <- train_models_with_cv(dash_2021, train_formula_v, train_formula_h)
+#formula for all aspects
+models_with_cv <- train_models_with_cv(dash_2021, train_formula_v, train_formula_h )
+
 
 ivb_model_with_cv <- models_with_cv[[1]]
 ihb_model_with_cv <- models_with_cv[[2]]
@@ -72,26 +123,6 @@ print(ivb_cv_results)
 ihb_cv_results <- ihb_model_with_cv$results
 print(ihb_cv_results)
 
-# Calculate mean and standard deviation of RMSE and Rsquared for IVB model
-ivb_mean_rmse <- mean(ivb_cv_results$RMSE)
-ivb_sd_rmse <- sd(ivb_cv_results$RMSE)
-ivb_mean_r2 <- mean(ivb_cv_results$Rsquared)
-ivb_sd_r2 <- sd(ivb_cv_results$Rsquared)
-
-cat("IVB Model:\n")
-cat(paste("Mean RMSE:", ivb_mean_rmse, "SD RMSE:", ivb_sd_rmse, "\n"))
-cat(paste("Mean Rsquared:", ivb_mean_r2, "SD Rsquared:", ivb_sd_r2, "\n"))
-
-# Calculate mean and standard deviation of RMSE and Rsquared for IHB model
-ihb_mean_rmse <- mean(ihb_cv_results$RMSE)
-ihb_sd_rmse <- sd(ihb_cv_results$RMSE)
-ihb_mean_r2 <- mean(ihb_cv_results$Rsquared)
-ihb_sd_r2 <- sd(ihb_cv_results$Rsquared)
-
-cat("\nIHB Model:\n")
-cat(paste("Mean RMSE:", ihb_mean_rmse, "SD RMSE:", ihb_sd_rmse, "\n"))
-cat(paste("Mean Rsquared:", ihb_mean_r2, "SD Rsquared:", ihb_sd_r2, "\n"))
-
 # Make predictions
 predictions_ivb <- predict(ivb_model_with_cv, dash_2022)
 predictions_ihb <- predict(ihb_model_with_cv, dash_2022)
@@ -99,8 +130,8 @@ predictions_ihb <- predict(ihb_model_with_cv, dash_2022)
 dash_2022 <- dash_2022 %>%
   mutate(xIVB = predictions_ivb,
          xHB = predictions_ihb,
-         diffVB = V.Mov - xIVB,
-         diffHB = H.Mov - xHB)
+         diffVB = V_Mov - xIVB,
+         diffHB = H_Mov - xHB)
 
 # Print dash_2022 with predictions and differences
 print(dash_2022)
@@ -145,13 +176,13 @@ top_10_worst <- top_10_worst %>%
   ) %>%
   arrange(diffVB)
 
-nice_table <- top_10_best %>%
-  select(Name, V.Mov, xIVB, diffVB, active_spin) %>%
+best_table <- top_10_best %>%
+  select(Name, V_Mov, xIVB, diffVB, active_spin) %>%
   gt() %>%
   tab_header(title = "Overachievers") %>%
   cols_label(
     Name = "Name",
-    V.Mov = "IVB",
+    V_Mov = "IVB",
     xIVB = "xIVB",
     diffVB = "Difference",
     active_spin = "Spin Efficiency"
@@ -189,8 +220,50 @@ nice_table <- top_10_best %>%
   )
 
 # Display the table in the console
-print(nice_table)
+print(best_table)
 
+worst_table <- top_10_worst %>%
+  select(Name, V_Mov, xIVB, diffVB, active_spin) %>%
+  gt() %>%
+  tab_header(title = "Underachievers") %>%
+  cols_label(
+    Name = "Name",
+    V_Mov = "IVB",
+    xIVB = "xIVB",
+    diffVB = "Difference",
+    active_spin = "Spin Efficiency"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold", size = "large", color = "white"),
+    locations = cells_title()
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold", color = "white"),
+    locations = cells_column_labels()
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "black"),
+    locations = cells_title()
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "black"),
+    locations = cells_column_labels()
+  ) %>%
+  tab_style(
+    style = cell_text(color = "white"),
+    locations = cells_body()
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "black"),
+    locations = cells_body()
+  ) %>%
+  tab_options(
+    table.font.names = "Times New Roman", # Replace "Arial" with your preferred font
+    table.border.top.width = px(0),
+    table.border.bottom.width = px(0),
+    table.border.left.width = px(0),
+    table.border.right.width = px(0)
+  )
 
-
-
+# Display the table in the console
+print(worst_table)
